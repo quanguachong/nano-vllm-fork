@@ -160,10 +160,10 @@ graph TB
 1. 新请求不会被 prefill 饥饿。
 2. 完成 prefill 后的请求会立刻被加入到 decode 批处理中。
 
-### 4.2 CUDA Graph
+### 4.3 CUDA Graph
 
-1. 为不同批次大小（1, 2, 4, 8, 16, 32, ..., 512）预先捕获 CUDA 图 ([model_runner.py](../nanovllm/engine/model_runner.py) line228-229)
-2. 使用反向顺序捕获以复用内存池 ([model_runner.py](../nanovllm/engine/model_runner.py) line500)
+1. 为不同批次大小（1, 2, 4, 8, 16, 32, ..., 512）预先捕获 CUDA 图 ([model_runner.py](../nanovllm/engine/model_runner.py))
+2. 使用反向顺序捕获以复用内存池 ([model_runner.py](../nanovllm/engine/model_runner.py))
 3. 在 run_model() 中，根据批次大小选择合适的图并 replay：
     - 查找不小于当前批次大小的最小预捕获图
     - 更新输入张量数据

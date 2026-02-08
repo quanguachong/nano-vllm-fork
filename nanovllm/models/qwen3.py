@@ -46,6 +46,7 @@ class Qwen3Attention(nn.Module):
             self.total_num_kv_heads,
             bias=qkv_bias,
         )
+        # 输出投影：将多头 attention 的拼接结果 (num_heads * head_dim) 映射回 hidden_size，即 Attention 子层的最终输出
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,

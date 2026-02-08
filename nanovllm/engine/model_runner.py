@@ -330,17 +330,31 @@ class ModelRunner:
         """
         【关键】准备 decode 阶段的输入：每个序列只处理最后一个 token
         
+        为什么 decode 只需要 last token？
+        - 历史 token 的 K/V 已在 prefill 或上一轮 decode 中写入 KV cache；attention 时只需用
+          当前 token 的 Q 去查 cache 里的 K/V（通过 block_tables + context_lens 定位），无需再
+          输入整段序列。
+        - 因此只需把「当前最后一个 token」送进模型：embedding → 各层用 Q(new) 与 cache 中 K/V 做
+          attention → 得到 logits 预测下一个 token；同时把本步算出的 K/V 按 slot_mapping 写回 cache。
+        
+        注意：input_ids 里的是「当前序列已有的最后一个 token」（已存在，不是即将生成的）。
+        自回归流程：用该 last token 作为输入 → 模型输出「下一个位置」的 logits → 采样得到新 token
+        → 由 Scheduler 调用 seq.append_token() 追加；下一轮 decode 时该新 token 成为新的 last_token。
+        
         核心逻辑：
-        1. 每个序列只取最后一个 token（decode 阶段每次生成一个 token）
+        1. 每个序列只取最后一个 token（decode 阶段每次只输入这一个 token）
         2. 计算每个序列的 context_len（总长度，用于 flash-attn）
-        3. 计算 slot_mapping：新 token 在 KV cache 中的写入位置
+        3. 计算 slot_mapping：本步要写入的 K/V 在 KV cache 中的 slot（即「即将写入的新 token」的位置）
         4. 准备 block_table：用于 flash-attn 查找历史 KV cache
         
         Args:
             seqs: 序列列表
             
         Returns:
-            (input_ids, positions): 输入 token IDs 和位置编码
+            (input_ids, positions): 输入 token IDs 和位置编码，均为 CUDA 上的 1D LongTensor。
+            示例：batch_size=2，序列长度分别为 5 和 3 时，
+                input_ids  = tensor([seq0.last_token, seq1.last_token])   # shape (2,)
+                positions  = tensor([4, 2])   # 即 [len(seq0)-1, len(seq1)-1]
         """
         input_ids = []
         positions = []
@@ -348,8 +362,8 @@ class ModelRunner:
         context_lens = []  # 每个序列的总长度（用于 flash-attn）
         
         for seq in seqs:
-            input_ids.append(seq.last_token)  # 只取最后一个 token
-            positions.append(len(seq) - 1)  # 最后一个 token 的位置
+            input_ids.append(seq.last_token)  # 已有序列的最后一个 token（作为本步输入，不是即将生成的）
+            positions.append(len(seq) - 1)  # 该 token 在序列中的位置（从 0 计）
             context_lens.append(len(seq))  # 序列总长度
             
             # 计算新 token 的 KV cache 写入位置
@@ -403,9 +417,17 @@ class ModelRunner:
         """
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             # Prefill 阶段或禁用 CUDA Graph 或批次过大：直接运行
+            # model(input_ids, positions) 计算流程：embed_tokens(input_ids) → hidden_states；逐层 DecoderLayer(positions, hidden_states)；
+            # 每层内 self_attn 用 positions 做 RoPE(positions, q, k)，再 attention(q,k,v) 与 KV cache 读写；最后 lm_head 得到 logits
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             # Decode 阶段 + CUDA Graph：使用预捕获的计算图加速
+            # CUDA Graph 如何利用 KV cache：
+            # - 捕获的是「固定形状」的一次前向：embedding(last_token) → 各层 attention 读 cache(block_tables, context_lens)、写 cache(slot_mapping) → 输出 hidden。KV cache 本体 (k_cache/v_cache) 是同一块显存，不在 graph 内「存数据」，只在 graph 内被读写。
+            # - 每次 replay 前只更新「寻址」张量：input_ids/positions（本步输入）、slot_mapping（本步写哪）、context_lens/block_tables（从哪读历史）。同一套 kernel 按新下标读写同一块 cache，从而支持不同序列、不同步数。
+            # - 为何「读的 K/V 数量」增加不会导致 graph 变化？Graph 里固定的是 **kernel 的启动**（同一批 kernel、同一批指针、同一 launch 配置），不是「这次会算多少数据」。attention kernel 被 launch 后，在**内部**从 context_lens/block_tables 的 buffer 里读当前值，再按这个值决定读多少 cache；所以「读多少」是 kernel 运行时的数据依赖，不改变 launch 序列。Replay 只是把同一套 launch 再执行一遍，每次 launch 时 buffer 里已是新值，graph 本身不变。
+            # 此时 input_ids/positions 为 [batch_size]，每个元素是各 seq 的 last token 及其位置；
+            # 模型对该 last token 做一次前向，输出的 logits 对应「下一个 token」的分布，由 sampler 采样后由 Scheduler 追加到 seq。
             bs = input_ids.size(0)
             context = get_context()
             
@@ -413,7 +435,7 @@ class ModelRunner:
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
             
-            # 更新 graph 的输入变量
+            # 更新 graph 的输入/寻址变量（cache 内容不变，只改「读哪里、写哪里」）
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
             graph_vars["slot_mapping"].fill_(-1)
@@ -468,6 +490,13 @@ class ModelRunner:
         - 将模型的计算流程捕获为静态计算图
         - 运行时直接重放（replay）计算图，避免 Python 解释器开销
         - 显著提升 decode 阶段的吞吐量（通常 2-3x 加速）
+        
+        CUDA Graph 与 KV cache 的配合：
+        - KV cache（k_cache/v_cache）在 allocate_kv_cache 时已分配，是长期存在的显存；graph 捕获的
+          只是「对这一块显存做读写的 kernel 序列」，不拷贝 cache 内容。
+        - 每次 replay 前写入 graph_vars：input_ids、positions、slot_mapping、context_lens、block_tables。
+          attention 层根据 slot_mapping 把本步的 K/V 写入 cache，根据 context_lens+block_tables 从 cache
+          读历史 K/V。因此同一份 graph 可复用于不同请求、不同步数，只要在 replay 前填好上述寻址张量即可。
         
         捕获策略：
         - 为多个批次大小（1, 2, 4, 8, 16, 32, ...）分别捕获 graph
