@@ -199,9 +199,9 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()  # 获取 GPU 显存信息
-        used = total - free  # 已使用的显存
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]  # 峰值显存
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]  # 当前显存
+        used = total - free  # 已使用的显存（常驻张量+其他显存占用）
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]  # peak = warmup 前向传播过程中，张量（常驻+临时）占用的显存峰值
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]  # 当前张量（常驻）显存
         
         # 计算每个 rank 的 KV heads 数量（张量并行时每个 GPU 只处理部分 heads）
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
@@ -217,7 +217,12 @@ class ModelRunner:
         
         # 【关键】一次性分配所有 KV cache blocks 的显存
         # 形状：[2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
-        # 2 表示 K cache 和 V cache
+        #   - 2: K 和 V 两个缓存
+        #   - hf_config.num_hidden_layers: Transformer 层数
+        #   - config.num_kvcache_blocks: 每层的 KV cache block 数
+        #   - self.block_size: 每个 block 的序列长度（tokens）
+        #   - num_kv_heads: attention head 数
+        #   - head_dim: 每个 head 的隐藏维度
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         
         # 将每个 attention 层的 k_cache 和 v_cache 指向这个大 tensor 的对应切片
@@ -263,13 +268,21 @@ class ModelRunner:
         Returns:
             (input_ids, positions): 输入 token IDs 和位置编码
         """
+        # 本批次所有序列的未缓存 token ID，按序列顺序展平（供模型 embedding 与 attention 使用）
         input_ids = []
+        # 与 input_ids 一一对应的位置编码，从各序列的 num_cached_tokens 起连续递增
         positions = []
-        cu_seqlens_q = [0]  # query 的累积长度（用于 flash-attn）
-        cu_seqlens_k = [0]  # key 的累积长度（用于 flash-attn）
+        # query 的累积长度 [0, len_q_0, len_q_0+len_q_1, ...]，用于 flash-attn 划分各序列的 query 边界（只含未缓存部分）
+        cu_seqlens_q = [0]
+        # key 的累积长度 [0, len_k_0, ...]，用于 flash-attn 划分各序列的 key 边界（含已缓存的 prefix，即整段序列）
+        cu_seqlens_k = [0]
+        # 本批次中最长 query 长度（未缓存 token 数），用于 flash-attn 的 max_seqlen_q
         max_seqlen_q = 0
+        # 本批次中最长 key 长度（整段序列长），用于 flash-attn 的 max_seqlen_k
         max_seqlen_k = 0
-        slot_mapping = []  # token 到 KV cache slot 的映射
+        # 每个 token 在 KV cache 中的物理 slot 索引（block_id * block_size + offset），按 input_ids 顺序对应，供 attention 写 KV
+        slot_mapping = []
+        # 各序列的 block 表 [num_seqs, max_blocks]，用于存在 prefix cache 时 flash-attn 查历史 KV；无 prefix 时为 None
         block_tables = None
         
         for seq in seqs:
@@ -471,14 +484,16 @@ class ModelRunner:
         # 创建固定大小的输入/输出 tensor（CUDA Graph 需要固定大小的 tensor）
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
+        # decode 时每个序列新 token 写入 KV cache 的 slot 索引 [batch_size]；捕获时零占位，重放前从 context 拷贝
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+        # 每个序列的当前总长度（供 flash-attn 使用）[batch_size]；捕获时零占位，重放前从 context 拷贝
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         
         # 定义要捕获的批次大小列表：[1, 2, 4, 8, 16, 32, 48, 64, ...]
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-        self.graphs = {}  # 存储不同批次大小的 graph
+        self.graphs = {}  # 存储不同批次大小的 graph(存在 CPU 内存)
         self.graph_pool = None  # graph 内存池（共享内存）
 
         # 从大到小捕获 graph（确保 graph_pool 足够大）
